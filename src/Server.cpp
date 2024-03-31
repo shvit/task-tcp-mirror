@@ -1,134 +1,101 @@
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
-
+#include <functional>
 #include "Server.hpp"
 
 namespace ttm {
 
-void on_read(evutil_socket_t fd, short flags, void* arg) {
-    // TODO:
-}
-
-void on_write(evutil_socket_t fd, short flags, void* arg) {
-    // TODO:
-}
-
-static void on_accept(evutil_socket_t listen_sock, short flags, void* arg) {
-    ConnList& lst = *((ConnList*)arg);
-    evutil_socket_t fd = accept(listen_sock, 0, 0);
-
-    if(fd < 0) {
-        ERR("Failed accept()");
-        return;
-    }
-    INF("New connection fd %d", fd);
-
-    if(evutil_make_socket_nonblocking(fd) < 0) {
-        ERR("Failed evutil_make_socket_nonblocking()");
-        return;
-    }
-
-    auto ctx = lst.emplace_back();
-    ctx.base = lst.front().base;
-    ctx.read_buff_used = 0U;
-    ctx.write_buff_used = 0U;
-    ctx.fd = fd;
-
-    ctx.read_event = event_new(ctx.base, fd, EV_READ | EV_PERSIST, on_read, (void*)&ctx);
-    if(!ctx.read_event) {
-        ERR("Failed event_new() for EV_READ");
-        return;
-    }
-
-    ctx.write_event = event_new(ctx.base, fd, EV_WRITE | EV_PERSIST, on_write, (void*)&ctx);
-    if(!ctx.write_event) {
-        ERR("Failed event_new() for EV_WRITE");
-        return;
-    }
-
-    if(event_add(ctx.read_event, NULL) < 0) {
-        ERR("Failed event_add()");
-        return;
-    }
-}
-
-static void on_close(ConnCtx& ctx) {
-    INF("Closing fd %d", ctx.fd);
-    event_del(ctx.read_event);
-    event_free(ctx.read_event);
-
-    if(ctx.write_event) {
-        event_del(ctx.write_event);
-        event_free(ctx.write_event);
-    }
-
-    close(ctx.fd);
-}
-
-void Server::run(const char* host, uint16_t port) {
-    if (lst.size()) {
-        WRN("On initialize, other socet already used");
-        lst.clear();
-    }
-
-    auto first = lst.emplace_front();
-
-    first.fd = socket(AF_INET, SOCK_STREAM, 0);
-    if (first.fd < 0) {
+bool Server::listen_start(const char* host, uint16_t port) {
+   fd_main = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    if (fd_main < 0) {
         ERR("Failed create socket");
-        return;
+        return false;
     }
 
-    if(evutil_make_socket_nonblocking(first.fd) < 0) {
-        ERR("Failed call evutil_make_socket_nonblocking()");
-        return;
+    if (int opt=1; setsockopt(fd_main, SOL_SOCKET, SO_REUSEADDR, (char*)&opt, sizeof(opt))) {
+        ERR("Failed set socket option reuse addr");
+        listen_stop();
+        return false;
     }
 
     struct sockaddr_in sin;
     sin.sin_family = AF_INET;
     sin.sin_port = htons(port);
     sin.sin_addr.s_addr = inet_addr(host);
-    if(bind(first.fd, (struct sockaddr*)&sin, sizeof(sin)) < 0) {
+    if(bind(fd_main, (struct sockaddr*)&sin, sizeof(sin)) < 0) {
         ERR("Binding failed on %s:%u", host, port);
-        return;
+        listen_stop();
+        return false;
     }
 
-    if(listen(first.fd, 1000) < 0) {
-        ERR("Listening failed");
-        return;
+    if(listen(fd_main, 100)) {
+        ERR("Listening failed on %s:%u", host, port);
+        listen_stop();
+        return false;
     }
 
-    auto base = event_base_new();
-    if(!base) {
-        ERR("Failed event_base_new()");
-        return;
-    }
-
-    auto accept_event = event_new(base, lst.front().fd, EV_READ | EV_PERSIST, on_accept, (void*)&lst);
-    if(!accept_event) {
-        ERR("Failed event_new()");
-        return;
-    }
-
-    lst.front().base = base;
-    lst.front().read_event = accept_event;
-
-    if(event_add(accept_event, NULL) < 0) {
-        ERR("Failed event_add()");
-        return;
-    }
-
-    if(event_base_dispatch(base) < 0) {
-        ERR("Failed event_base_dispatch()");
-        return;
-    }
-
-    // free 
-    on_close(lst.front());
-    event_base_free(base);
-
+    return true;
 }
 
+void Server::listen_stop() {
+    close(fd_main);
+    fd_main = -1;
+}
+
+void Server::client_data_cb(ev::io &w, int revents) {
+    auto cl = clients_list.find(w.fd);
+    if (cl != clients_list.end()) {
+        cl->second.data_size = recvfrom(cl->second.fd, cl->second.buffer, sizeof(cl->second.buffer) - 1, 0, (struct sockaddr*) &cl->second.addr, (socklen_t *) &cl->second.addr_len);
+        if (cl->second.data_size > 0) {
+            cl->second.buffer[cl->second.data_size] = '\0';
+            INF("RX from client (fd=%d): %ld bytes: '%s'", cl->second.fd, cl->second.data_size, cl->second.buffer);
+            sendto(cl->second.fd, cl->second.buffer, cl->second.data_size, 0, (struct sockaddr*) &cl->second.addr, cl->second.addr_len);
+        } else {
+            close(w.fd);
+            cl->second.io->stop();
+            clients_list.erase(cl);
+            INF("Client (fd=%d) disconnected. Left %lu clients", w.fd, clients_list.size());
+        }
+    }
+}
+
+void Server::add_client_cb(ev::io &w, int revents) {
+    struct sockaddr_in addr;
+    socklen_t addr_len;
+    int temp_fd = accept(fd_main, (struct sockaddr *)&addr, &addr_len);
+    if (temp_fd < 0) {
+        return;
+    }
+    auto [iter, flag] = clients_list.emplace(temp_fd, Client{});
+    iter->second.fd = temp_fd;
+    iter->second.addr = addr;
+    iter->second.addr_len = addr_len;
+    iter->second.io = std::make_unique<ev::io>();
+    iter->second.io->set <Server, &Server::client_data_cb>(this);
+    iter->second.io->set(temp_fd, ev::READ);
+    iter->second.io->start();
+    INF("Connected new client (%lu) with fd=%d", clients_list.size(), temp_fd);
+}
+
+bool Server::run(const char* host, uint16_t port) {
+    INF("Try to running server");
+    if (fd_main < 0) {
+        if (listen_start(host, port)) {
+            INF("Successful start listening");
+        } else {
+            ERR("Failed start listening");
+            return false;
+        }
+    }
+
+    ev::io io;
+    io.set <Server, &Server::add_client_cb >(this);
+    io.set(fd_main, ev::READ);
+    io.start();
+    io.loop.run();
+
+    return true;
+}
 
 } // namespace ttm
