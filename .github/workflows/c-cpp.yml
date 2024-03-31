@@ -1,0 +1,25 @@
+name: C/C++ CI
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+
+jobs:
+  build:
+
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v3
+    - name: dependency
+      run: sudo apt update && sudo apt install -yq cmake libev-dev
+    - name: cmake
+      run: mkdir -p build && cd build && cmake ..
+    - name: make
+      run: cd build && make
+    - name: run server
+      run: cd build && ./ttm &
+    - name: check
+      run: ./test.sh
